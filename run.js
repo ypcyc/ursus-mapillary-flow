@@ -1,4 +1,11 @@
-import { access, opendir, stat, mkdir, copyFile } from "node:fs/promises";
+import {
+  access,
+  opendir,
+  stat,
+  mkdir,
+  copyFile,
+  writeFile,
+} from "node:fs/promises";
 import { createWriteStream, createReadStream, readFileSync } from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
@@ -8,10 +15,11 @@ import cliProgress from "cli-progress";
 import { spawn } from "node:child_process";
 import { rename } from "node:fs/promises";
 import { readFile } from "node:fs/promises";
-import tzlookup from "tz-lookup";
 import exifr from "exifr";
 import { exiftool } from "exiftool-vendored";
 import { ExifDateTime } from "exiftool-vendored";
+import { processAndConvert } from "./gps-to-gpx.js";
+import { DOMParser } from "xmldom";
 
 // ----- YOUR ACTIONS (plug your logic here) -----
 
@@ -28,6 +36,8 @@ const DEST = "E:\\Ursus_Mapillary_Script";
 const LOG_FILE = "copied.log";
 
 const GOPRO_VERSION_PATH = ["MISC", "version.txt"];
+
+const CAM_70MAI_GPS_DATA_PATH = ["GPSData000001.txt"];
 
 // ---------- HELPERS ----------
 const exists = async (p) => {
@@ -164,6 +174,7 @@ const copyWithProgress = async (
   destMap,
   destFolderSet,
   totalSize,
+  sTarget,
 ) => {
   const bar = new cliProgress.SingleBar({
     format:
@@ -178,7 +189,13 @@ const copyWithProgress = async (
   bar.start(totalSize, 0);
 
   for (const file of diff) {
-    const destPath = buildDestPath(file.rel, srcMap, destMap, destFolderSet);
+    const destPath = buildDestPath(
+      file.rel,
+      srcMap,
+      destMap,
+      destFolderSet,
+      sTarget,
+    );
 
     await mkdir(path.dirname(destPath), { recursive: true });
     await copyFile(file.full, destPath);
@@ -209,21 +226,44 @@ const buildFolderSet = (fileMap) => {
   return set;
 };
 
-const buildFileMap = async (root) => {
+const buildFileMap = async (sFolder, sDeviceType) => {
   const map = new Map();
 
-  const walk = async (dir) => {
+  // define allowed root folders per device
+  const getAllowedRootFolders = (type) => {
+    switch (type) {
+      // case "gopro":
+      //   return ["100GOPRO", "101GOPRO", "102GOPRO"];
+      case "70mai":
+        return ["Front", "Rear"]; // adjust if needed
+      default:
+        return null; // null = allow everything
+    }
+  };
+
+  const allowedRoots = getAllowedRootFolders(sDeviceType);
+
+  const walk = async (dir, isRootLevel = false) => {
     const aDirEntries = await opendir(dir);
 
     for await (const oEntry of aDirEntries) {
       const full = path.join(dir, oEntry.name);
 
       if (oEntry.isDirectory()) {
-        await walk(full);
+        // 🚫 filter ONLY at root level
+        if (
+          isRootLevel &&
+          allowedRoots &&
+          !allowedRoots.includes(oEntry.name)
+        ) {
+          continue;
+        }
+
+        await walk(full, false);
       } else {
         const s = await stat(full);
 
-        const relative = path.relative(root, full);
+        const relative = path.relative(sFolder, full);
 
         map.set(relative, {
           name: oEntry.name,
@@ -235,7 +275,9 @@ const buildFileMap = async (root) => {
     }
   };
 
-  await walk(root);
+  // start from root → enable filtering
+  await walk(sFolder, true);
+
   return map;
 };
 
@@ -296,8 +338,8 @@ const calculateDiff = (srcMap, destMap) => {
   return { diff, totalSize };
 };
 
-const buildDestPath = (relPath, srcMap, destMap, destFolderSet) => {
-  const destBase = DEST;
+const buildDestPath = (relPath, srcMap, destMap, destFolderSet, sTarget) => {
+  const destBase = sTarget;
   const src = srcMap.get(relPath);
 
   const parts = relPath.split(/[\\/]/); // IMPORTANT FIX
@@ -315,6 +357,46 @@ const buildDestPath = (relPath, srcMap, destMap, destFolderSet) => {
   const versionFolder = path.join(destBase, `${folder}_${date}`);
 
   return path.join(versionFolder, fileName);
+};
+
+const getDestinationDeviceFolders = async (dirPath, options = {}) => {
+  const {
+    requireFile = null, // e.g. "mapillary_image_description.json"
+  } = options;
+
+  const result = [];
+
+  const rootDir = await opendir(dirPath);
+
+  for await (const deviceEntry of rootDir) {
+    if (!deviceEntry.isDirectory()) continue;
+
+    const devicePath = path.join(dirPath, deviceEntry.name);
+    //const deviceDir = await opendir(devicePath);
+
+    result.push(devicePath);
+
+    // for await (const entry of deviceDir) {
+    //   if (!entry.isDirectory() || entry.name.startsWith("processed_")) continue;
+
+    //   const folderPath = path.join(devicePath, entry.name);
+
+    //   if (requireFile) {
+    //     const filePath = path.join(folderPath, requireFile);
+
+    //     try {
+    //       await access(filePath);
+    //     } catch (error) {
+    //       //console.log(error);
+    //       continue; // file does not exist → skip
+    //     }
+    //   }
+
+    //   result.push(path.join(deviceEntry.name, entry.name));
+    // }
+  }
+
+  return result;
 };
 
 const getDestinationFolders = async (dirPath, options = {}) => {
@@ -359,7 +441,7 @@ function runMapillaryProcess(imagePath) {
   return new Promise((resolve, reject) => {
     const proc = spawn(
       "mapillary_tools",
-      ["process", imagePath, "--skip_process_errors"],
+      ["process", imagePath, "--skip_process_errors", "--duplicate_distance 1"],
       {
         stdio: "pipe",
         shell: true, // IMPORTANT on Windows
@@ -423,6 +505,163 @@ const moveToProcessed = async (folderPath) => {
 };
 
 export const processFolders = async () => {
+  const folders = await getDestinationDeviceFolders(DEST);
+
+  const selectedFolder = await selectFolder(folders);
+
+  const subfolders = await getSubfolders(selectedFolder);
+
+  for (const folder of subfolders) {
+    console.log("➡️", folder);
+
+    //const folderFullPath = path.join(selectedFolder, folder);
+
+    await runMapillaryProcess(folder);
+  }
+};
+
+export const getSubfolders = async (parentFolder, options = {}) => {
+  const { requireFile = null } = options;
+  const result = [];
+
+  const dir = await opendir(parentFolder);
+
+  for await (const entry of dir) {
+    if (!entry.isDirectory() || entry.name.startsWith("processed_")) continue;
+
+    const childFolder = path.join(parentFolder, entry.name);
+
+    if (requireFile) {
+      try {
+        await access(path.join(childFolder, requireFile));
+      } catch {
+        continue;
+      }
+    }
+
+    result.push(childFolder);
+  }
+
+  return result;
+};
+
+export const collectGpxFiles = async (rootDir) => {
+  const result = [];
+
+  const walk = async (dir) => {
+    const dirents = await opendir(dir);
+
+    for await (const entry of dirents) {
+      const fullPath = path.join(dir, entry.name);
+
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+        continue;
+      }
+
+      if (entry.isFile() && entry.name.toLowerCase().endsWith(".gpx")) {
+        result.push(fullPath);
+      }
+    }
+  };
+
+  await walk(rootDir);
+
+  return result;
+};
+
+function runMapillaryVideoProcess(video_file_path, gpx_file, gpxStartTime) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(
+      "mapillary_tools",
+      [
+        "video_process",
+        video_file_path,
+        "--geotag_source",
+        "gpx",
+        "--geotag_source_path",
+        gpx_file,
+        "--video_sample_distance",
+        "-1",
+        "--video_sample_interval",
+        "0.1",
+        "--video_start_time",
+        gpxStartTime,
+        "--skip_process_errors",
+      ],
+      {
+        stdio: "pipe",
+        shell: true, // IMPORTANT on Windows
+      },
+    );
+
+    proc.stdout.on("data", (data) => {
+      console.log(`[OUT] ${data.toString()}`);
+    });
+
+    proc.stderr.on("data", (data) => {
+      console.error(`[ERR] ${data.toString()}`);
+    });
+
+    proc.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`mapillary_tools failed with code ${code}`));
+    });
+  });
+}
+
+async function getStartTimeFromGpx(gpxFileContent) {
+  const rawContent = await readFile(gpxFileContent, { encoding: "utf-8" });
+
+  const parser = new DOMParser();
+  const xmlDoc = parser.parseFromString(rawContent, "text/xml");
+
+  const timeElements = xmlDoc.getElementsByTagName("time");
+
+  if (!timeElements || timeElements.length === 0) {
+    return null;
+  }
+
+  const timeStr = timeElements[0].textContent.trim();
+
+  const [datePart, timePartFull] = timeStr.split("T");
+  const timePart = timePartFull.split(".")[0];
+
+  const [year, month, day] = datePart.split("-");
+  const [hour, minute, second] = timePart.split(":");
+
+  return `${year}_${month}_${day}_${hour}_${minute}_${second}_000000`;
+}
+
+export const process70maiVideos = async (aGpxFiles) => {
+  aGpxFiles.forEach(async (filePath) => {
+    const destDir = path.dirname(filePath);
+
+    const filename = path.basename(filePath);
+    const nameWithoutExt = path.parse(filePath).name;
+
+    const gpxStartTime = await getStartTimeFromGpx(filePath);
+
+    const videoFilePairPath = path.join(destDir, nameWithoutExt + ".MP4");
+    try {
+      await access(videoFilePairPath);
+    } catch {
+      // ignore
+    }
+
+    const tempDirForVideoFileExtractedImages = path.join(
+      destDir,
+      nameWithoutExt,
+    );
+
+    await mkdir(tempDirForVideoFileExtractedImages, { recursive: true });
+
+    await runMapillaryVideoProcess(videoFilePairPath, filePath, gpxStartTime);
+  });
+};
+
+export const process70maiFolders = async () => {
+  let aGpxFiles = [];
   const folders = await getDestinationFolders(DEST);
 
   for (const folder of folders) {
@@ -430,8 +669,11 @@ export const processFolders = async () => {
 
     const folderFullPath = path.join(DEST, folder);
 
-    await runMapillaryProcess(folderFullPath);
+    aGpxFiles = [...aGpxFiles, ...(await collectGpxFiles(folderFullPath))];
+    //await runMapillaryProcess(folderFullPath);
   }
+
+  await process70maiVideos(aGpxFiles);
 };
 
 const parseGoProVersionFile = async (filePath) => {
@@ -487,22 +729,92 @@ const selectDrive = async (drives) => {
   return response.drive;
 };
 
-export const getTargetFolderForCard = async (selectedDrive) => {
-  //
-  //const filePath = "H:\\MISC\\version.txt";
-  const fullFilePath = path.join(selectedDrive, ...GOPRO_VERSION_PATH);
-  //const DEST = "E:\\Ursus_Mapillary_Script\\DCIM";
-
-  const info = await parseGoProVersionFile(fullFilePath);
-
-  if (!info) {
-    console.log("version.txt not found");
-    return;
+const selectFolder = async (folders) => {
+  if (folders.length === 0) {
+    throw new Error("No folders found");
   }
 
-  const cameraType = info["camera type"].replace(" ", "_");
+  const response = await prompts({
+    type: "select",
+    name: "folder",
+    message: "Select folder:",
+    choices: folders.map((folder) => ({
+      title: folder,
+      value: folder,
+    })),
+  });
 
-  return path.join(DEST, `${cameraType}_${info["wifi mac"]}`);
+  return response.folder;
+};
+
+export const getDeviceTypeForCard = async (selectedDrive) => {
+  // --- GoPro detection ---
+  try {
+    const goproVersionFilePath = path.join(
+      selectedDrive,
+      ...GOPRO_VERSION_PATH,
+    );
+
+    await access(goproVersionFilePath);
+
+    const info = await parseGoProVersionFile(goproVersionFilePath);
+
+    if (info) {
+      const cameraType = info["camera type"].replace(/\s+/g, "_");
+      const wifiMac = info["wifi mac"];
+
+      return {
+        type: "gopro",
+        name: cameraType,
+        id: wifiMac,
+        sourceFolder: path.join(selectedDrive, "DCIM"),
+        targetFolder: path.join(DEST, `${cameraType}_${wifiMac}`),
+        raw: info, // optional, useful for debugging
+      };
+    }
+  } catch {
+    // ignore
+  }
+
+  // --- 70MAI detection ---
+  try {
+    const cam70maiDevices = {
+      cam_70mai_v1: ["GPSData000001.txt"],
+      cam_70mai_v2: [".GPS", "GPSData000001.txt"],
+    };
+
+    const path = Object.keys(cam70maiDevices).find((type) => {
+      const testPath = cam70maiDevices[type];
+    });
+
+    const gpsPath = path.join(selectedDrive, ...CAM_70MAI_GPS_DATA_PATH);
+
+    await access(gpsPath);
+
+    //copy
+    const sTargetDir = path.join(DEST, `70MAI`);
+    await mkdir(path.dirname(sTargetDir), { recursive: true });
+    await copyFile(gpsPath, path.join(sTargetDir, ...CAM_70MAI_GPS_DATA_PATH));
+
+    return {
+      type: "70mai",
+      name: "70MAI",
+      id: null,
+      sourceFolder: path.join(selectedDrive, "Normal"),
+      targetFolder: sTargetDir,
+    };
+  } catch {
+    // ignore
+  }
+
+  // --- fallback ---
+  return {
+    type: "unknown",
+    name: "UNKNOWN_DEVICE",
+    id: null,
+    sourceFolder: path.join(selectedDrive, "unknown"),
+    targetFolder: path.join(DEST, "UNKNOWN_DEVICE"),
+  };
 };
 
 export const copyMainProcess = async () => {
@@ -518,13 +830,13 @@ export const copyMainProcess = async () => {
 
   console.log("Selected:", selectedDrive);
 
-  const sTargetFolder = await getTargetFolderForCard(selectedDrive);
+  const device = await getDeviceTypeForCard(selectedDrive);
 
-  console.log("Target dir:", sTargetFolder);
+  console.log("Target dir:", device.targetFolder);
 
-  const sSource = path.join(selectedDrive, "DCIM");
+  //const sSource = path.join(selectedDrive, "DCIM");
 
-  await copyMissingFiles(sSource, sTargetFolder);
+  await copyMissingFiles(device.sourceFolder, device.targetFolder, device.type);
 };
 
 const fixExifTakenDate = async (rootDir) => {
@@ -658,9 +970,102 @@ export const fixExifDateProcess = async () => {
   //fixExifTakenDate(DEST);
 };
 
-export const copyMissingFiles = async (sSource, sTarget) => {
+export const convert70MaiToGpx = async (filePath) => {
+  const parseLine = (line) => {
+    const parts = line.split(",");
+
+    if (parts.length < 4) return null;
+
+    const [timestamp, status, lat, lon, speedRaw, heading] = parts;
+
+    // Skip invalid GPS fixes
+    if (status !== "A") return null;
+
+    const time = new Date(Number(timestamp) * 1000).toISOString();
+
+    // Try to normalize speed (common dashcam format = km/h * 100)
+    const speed = speedRaw ? Number(speedRaw) / 100 : 0;
+
+    return {
+      lat: Number(lat),
+      lon: Number(lon),
+      speed,
+      heading: heading ? Number(heading) : null,
+      time,
+    };
+  };
+
+  const buildGpx = (points) => {
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="nodejs-script" xmlns="http://www.topografix.com/GPX/1/1">
+<trk>
+<trkseg>
+${points
+  .map(
+    (p) => `
+<trkpt lat="${p.lat}" lon="${p.lon}">
+    <time>${p.time}</time>
+    <extensions>
+        <speed>${p.speed}</speed>
+        ${p.heading !== null ? `<course>${p.heading}</course>` : ""}
+    </extensions>
+</trkpt>`,
+  )
+  .join("\n")}
+</trkseg>
+</trk>
+</gpx>`;
+  };
+  //
+
+  // const filePath = path.resolve(INPUT_FILE);
+  const content = await readFile(filePath, "utf-8");
+
+  const parsed = path.parse(filePath);
+
+  const outputFilePath = path.join(parsed.dir, parsed.name + ".gpx");
+
+  const points = content
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map(parseLine)
+    .filter(Boolean);
+
+  if (!points.length) {
+    throw new Error("No valid GPS points found.");
+  }
+
+  const gpx = buildGpx(points);
+
+  await writeFile(outputFilePath, gpx, "utf-8");
+
+  console.log(`✅ GPX file created: ${outputFilePath}`);
+};
+
+export const convert70MaiToGpxProcess = async () => {
+  const folders = await getDestinationDeviceFolders(DEST);
+
+  for (const folder of folders) {
+    //const folderFullPath = path.join(DEST, folder);
+
+    console.log("➡️ Checking GPSData000001.txt in:", folder);
+
+    try {
+      const cam70maiFilePath = path.join(folder, ...CAM_70MAI_GPS_DATA_PATH);
+      await access(cam70maiFilePath);
+
+      //await convert70MaiToGpx(cam70maiFilePath);
+      await processAndConvert(cam70maiFilePath);
+    } catch (err) {
+      console.warn("❌ GPSData000001.txt not found", folder, err.message);
+    }
+  }
+};
+
+export const copyMissingFiles = async (sSource, sTarget, sDeviceType) => {
   if (!(await exists(sSource))) {
-    console.log("❌ DCIM not found on H: drive");
+    console.log(`❌ ${sSource} not found`);
     return;
   }
 
@@ -669,10 +1074,10 @@ export const copyMissingFiles = async (sSource, sTarget) => {
   }
 
   console.log("📊 Scanning source...");
-  const srcMap = await buildFileMap(sSource);
+  const srcMap = await buildFileMap(sSource, sDeviceType);
 
   console.log("📊 Scanning destination...");
-  const destMap = await buildFileMap(sTarget);
+  const destMap = await buildFileMap(sTarget, sDeviceType);
   const destFolderSet = buildFolderSet(destMap);
 
   console.log("🔍 Calculating diff...");
@@ -705,7 +1110,14 @@ export const copyMissingFiles = async (sSource, sTarget) => {
   if (!proceed) return;
 
   console.log("🚀 Copying...");
-  await copyWithProgress(diff, srcMap, destMap, destFolderSet, totalSize);
+  await copyWithProgress(
+    diff,
+    srcMap,
+    destMap,
+    destFolderSet,
+    totalSize,
+    sTarget,
+  );
 
   console.log("✅ Done");
 };
@@ -744,14 +1156,22 @@ const mainMenu = async () => {
         { title: "1. Copy missing files", value: "copy" },
         { title: "2. Fix EXIF Taken Date", value: "fix_exif_date" },
         {
-          title: "3. Run 'mapillary_tools' process for all Folders",
+          title: "3. Convert GPSData000001.txt to .gpx",
+          value: "convert_70mai_to_gpx",
+        },
+        {
+          title: "4. video_process",
+          value: "process_70mai_videos",
+        },
+        {
+          title: "5. Run 'mapillary_tools' process for all Folders",
           value: "mapillary_process",
         },
         {
-          title: "4. Run 'mapillary_tools' upload for all Folders",
+          title: "6. Run 'mapillary_tools' upload for all Folders",
           value: "mapillary_upload",
         },
-        { title: "5. Exit", value: "exit" },
+        { title: "6. Exit", value: "exit" },
       ],
     });
 
@@ -768,14 +1188,18 @@ const mainMenu = async () => {
       case "fix_exif_date":
         await fixExifDateProcess();
         break;
+      case "convert_70mai_to_gpx":
+        await convert70MaiToGpxProcess();
+        break;
+      case "process_70mai_videos":
+        await process70maiFolders();
+        break;
       case "mapillary_process":
         await processFolders();
         break;
-
       case "mapillary_upload":
         await uploadFolders();
         break;
-
       case "exit":
         console.log("👋 Goodbye");
         process.exit(0);
