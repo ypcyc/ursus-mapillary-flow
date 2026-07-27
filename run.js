@@ -20,6 +20,8 @@ import { exiftool } from "exiftool-vendored";
 import { ExifDateTime } from "exiftool-vendored";
 import { processAndConvert } from "./gps-to-gpx.js";
 import { DOMParser } from "xmldom";
+import { readdir } from "node:fs/promises";
+import { pipeline } from "node:stream/promises";
 
 // ----- YOUR ACTIONS (plug your logic here) -----
 
@@ -39,7 +41,6 @@ const GOPRO_VERSION_PATH = ["MISC", "version.txt"];
 
 const CAM_70MAI_GPS_DATA_PATH = ["GPSData000001.txt"];
 const EXCLUDE_GEOJSON_FILE = "exclude.geojson";
-
 
 // ---------- HELPERS ----------
 const exists = async (p) => {
@@ -340,7 +341,6 @@ const calculateDiff = (srcMap, destMap) => {
   return { diff, totalSize };
 };
 
-
 const calculateTotalSize = (files) =>
   files.reduce((sum, file) => sum + file.size, 0);
 
@@ -374,8 +374,7 @@ const isPointInRing = (point, ring) => {
     const intersects =
       start[1] > point[1] !== end[1] > point[1] &&
       point[0] <
-        ((end[0] - start[0]) * (point[1] - start[1])) /
-          (end[1] - start[1]) +
+        ((end[0] - start[0]) * (point[1] - start[1])) / (end[1] - start[1]) +
           start[0];
 
     if (intersects) inside = !inside;
@@ -494,13 +493,37 @@ const getExcluded70MaiVideoNames = async (gpsPath, polygons) => {
     if (!line.trim() || line.includes("$V02") || line.includes("nan")) continue;
 
     const parts = line.trim().split(",");
-    if (parts.length <= 9) continue;
+    if (parts.length <= 7) continue;
 
-    const lat = Number(parts[2]);
-    const lon = Number(parts[3]);
-    const videoName = parts[9]?.trim();
+    //2026-04-11 12:17:48,
+    //B,
+    // A,
+    // 013km/h,
+    // 56.930094,
+    // 24.014493,
+    // 0,
+    // 20260411-131747-013650B.MP4
+    let lat, lon, videoName;
+    if (parts.length == 8) {
+      lat = Number(parts[4]);
+      lon = Number(parts[5]);
+      videoName = parts[7]?.trim();
 
-    if (!videoName || !Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+      videoName = videoName.replace("B.MP4", "");
+      videoName = videoName.replace("F.MP4", "");
+    } else if (parts.length == 10) {
+      lat = Number(parts[2]);
+      lon = Number(parts[3]);
+      videoName = parts[9]?.trim();
+    }
+
+    if (
+      !videoName ||
+      !Number.isFinite(lat) ||
+      !Number.isFinite(lon) ||
+      excluded.has(videoName.toLowerCase())
+    )
+      continue;
 
     const point = [lon, lat];
 
@@ -512,10 +535,13 @@ const getExcluded70MaiVideoNames = async (gpsPath, polygons) => {
   return excluded;
 };
 
-const apply70MaiExcludeFilter = async (diff, sTarget) => {
-  const polygons = await loadExcludePolygons(sTarget);
-  const gpsPath = path.join(sTarget, ...CAM_70MAI_GPS_DATA_PATH);
-  const excludedVideoNames = await getExcluded70MaiVideoNames(gpsPath, polygons);
+const apply70MaiExcludeFilter = async (diff, sTarget, gpsFilePath) => {
+  const polygons = await loadExcludePolygons(DEST);
+  const gpsPath = gpsFilePath;
+  const excludedVideoNames = await getExcluded70MaiVideoNames(
+    gpsPath,
+    polygons,
+  );
 
   if (excludedVideoNames.size === 0) {
     return { diff, totalSize: calculateTotalSize(diff) };
@@ -524,7 +550,12 @@ const apply70MaiExcludeFilter = async (diff, sTarget) => {
   const filteredDiff = diff.filter((file) => {
     if (!isMp4(file.name)) return true;
 
-    const shouldExclude = excludedVideoNames.has(file.name.toLowerCase());
+    const normalizedName = file.name
+      .replace("NO", "")
+      .replace("B.MP4", "")
+      .replace("F.MP4", "");
+
+    const shouldExclude = excludedVideoNames.has(normalizedName);
 
     if (shouldExclude) {
       console.log(
@@ -984,21 +1015,60 @@ export const getDeviceTypeForCard = async (selectedDrive) => {
 
   // --- 70MAI detection ---
   try {
-    const gpsPath = path.join(selectedDrive, ...CAM_70MAI_GPS_DATA_PATH);
+    const cam70maiDevices = {
+      cam_70mai_v1: [".GPS"],
+      cam_70mai_v2: [""],
+    };
 
-    await access(gpsPath);
+    const fnCheckParams = async () => {
+      for (const [device, pathParts] of Object.entries(cam70maiDevices)) {
+        const gpsPath = path.join(selectedDrive, ...pathParts);
+
+        const files = await readdir(gpsPath);
+
+        const gpsFiles = files
+          .filter((name) => /^GPSData\d{6}\.txt$/i.test(name))
+          .sort()
+          .map((name) => path.join(gpsPath, name));
+
+        if (gpsFiles.length > 0) {
+          return {
+            device,
+            gpsFiles,
+          };
+        }
+      }
+    };
+    //const gpsPath = path.join(selectedDrive, ...CAM_70MAI_GPS_DATA_PATH);
+
+    const devParams = await fnCheckParams();
+
+    const destGpsPath = path.join(DEST, devParams.device, "GPSData000001.txt");
+    const output = createWriteStream(destGpsPath);
+
+    for (const file of devParams.gpsFiles) {
+      await pipeline(createReadStream(file), output, { end: false });
+    }
+
+    output.end();
+
+    //await access(devParams[1]);
 
     //copy
-    const sTargetDir = path.join(DEST, `70MAI`);
-    await mkdir(sTargetDir, { recursive: true });
-    await copyFile(gpsPath, path.join(sTargetDir, ...CAM_70MAI_GPS_DATA_PATH));
+    // const sTargetDir = path.join(DEST, `70MAI`);
+    // await mkdir(sTargetDir, { recursive: true });
+    // await copyFile(
+    //   devParams[1],
+    //   path.join(sTargetDir, ...CAM_70MAI_GPS_DATA_PATH),
+    // );
 
     return {
       type: "70mai",
-      name: "70MAI",
+      name: devParams[0],
       id: null,
       sourceFolder: path.join(selectedDrive, "Normal"),
-      targetFolder: sTargetDir,
+      targetFolder: path.join(DEST, devParams.device),
+      gpsFilePath: destGpsPath,
     };
   } catch {
     // ignore
@@ -1033,7 +1103,7 @@ export const copyMainProcess = async () => {
 
   //const sSource = path.join(selectedDrive, "DCIM");
 
-  await copyMissingFiles(device.sourceFolder, device.targetFolder, device.type);
+  await copyMissingFiles(device);
 };
 
 const fixExifTakenDate = async (rootDir) => {
@@ -1240,6 +1310,24 @@ ${points
   console.log(`✅ GPX file created: ${outputFilePath}`);
 };
 
+export const get70MaiGpxProcess = async () => {
+  const folders = await getDestinationDeviceFolders(DEST);
+
+  for (const folder of folders) {
+    console.log("➡️ Checking GPSData000001.txt in:", folder);
+
+    try {
+      const cam70maiFilePath = path.join(folder, "GPSData000001.txt");
+      await access(cam70maiFilePath);
+
+      //await convert70MaiToGpx(cam70maiFilePath);
+      await processAndConvert(cam70maiFilePath);
+    } catch (err) {
+      console.warn("❌ GPSData000001.txt not found", folder, err.message);
+    }
+  }
+};
+
 export const convert70MaiToGpxProcess = async () => {
   const folders = await getDestinationDeviceFolders(DEST);
 
@@ -1260,28 +1348,32 @@ export const convert70MaiToGpxProcess = async () => {
   }
 };
 
-export const copyMissingFiles = async (sSource, sTarget, sDeviceType) => {
-  if (!(await exists(sSource))) {
-    console.log(`❌ ${sSource} not found`);
+export const copyMissingFiles = async (device) => {
+  if (!(await exists(device.sourceFolder))) {
+    console.log(`❌ ${device.sourceFolder} not found`);
     return;
   }
 
-  if (!(await exists(sTarget))) {
-    await mkdir(sTarget, { recursive: true });
+  if (!(await exists(device.targetFolder))) {
+    await mkdir(device.targetFolder, { recursive: true });
   }
 
   console.log("📊 Scanning source...");
-  const srcMap = await buildFileMap(sSource, sDeviceType);
+  const srcMap = await buildFileMap(device.sourceFolder, device.type);
 
   console.log("📊 Scanning destination...");
-  const destMap = await buildFileMap(sTarget, sDeviceType);
+  const destMap = await buildFileMap(device.targetFolder, device.type);
   const destFolderSet = buildFolderSet(destMap);
 
   console.log("🔍 Calculating diff...");
   let { diff, totalSize } = calculateDiff(srcMap, destMap);
 
-  if (sDeviceType === "70mai") {
-    ({ diff, totalSize } = await apply70MaiExcludeFilter(diff, sTarget));
+  if (device.type === "70mai") {
+    ({ diff, totalSize } = await apply70MaiExcludeFilter(
+      diff,
+      device.targetFolder,
+      device.gpsFilePath,
+    ));
   }
 
   if (diff.length === 0) {
@@ -1317,7 +1409,7 @@ export const copyMissingFiles = async (sSource, sTarget, sDeviceType) => {
     destMap,
     destFolderSet,
     totalSize,
-    sTarget,
+    device.targetFolder,
   );
 
   console.log("✅ Done");
@@ -1400,6 +1492,9 @@ const mainMenu = async () => {
         break;
       case "mapillary_upload":
         await uploadFolders();
+        break;
+      case "get_70mai_gpx":
+        await get70MaiGpxProcess();
         break;
       case "exit":
         console.log("👋 Goodbye");
