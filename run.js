@@ -38,6 +38,8 @@ const LOG_FILE = "copied.log";
 const GOPRO_VERSION_PATH = ["MISC", "version.txt"];
 
 const CAM_70MAI_GPS_DATA_PATH = ["GPSData000001.txt"];
+const EXCLUDE_GEOJSON_FILE = "exclude.geojson";
+
 
 // ---------- HELPERS ----------
 const exists = async (p) => {
@@ -336,6 +338,210 @@ const calculateDiff = (srcMap, destMap) => {
   }
 
   return { diff, totalSize };
+};
+
+
+const calculateTotalSize = (files) =>
+  files.reduce((sum, file) => sum + file.size, 0);
+
+const isMp4 = (name) => /\.mp4$/i.test(name);
+
+const isPointOnSegment = (point, start, end) => {
+  const [x, y] = point;
+  const [x1, y1] = start;
+  const [x2, y2] = end;
+  const cross = (x - x1) * (y2 - y1) - (y - y1) * (x2 - x1);
+
+  if (Math.abs(cross) > 1e-12) return false;
+
+  return (
+    x >= Math.min(x1, x2) &&
+    x <= Math.max(x1, x2) &&
+    y >= Math.min(y1, y2) &&
+    y <= Math.max(y1, y2)
+  );
+};
+
+const isPointInRing = (point, ring) => {
+  let inside = false;
+
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const start = ring[i];
+    const end = ring[j];
+
+    if (isPointOnSegment(point, start, end)) return true;
+
+    const intersects =
+      start[1] > point[1] !== end[1] > point[1] &&
+      point[0] <
+        ((end[0] - start[0]) * (point[1] - start[1])) /
+          (end[1] - start[1]) +
+          start[0];
+
+    if (intersects) inside = !inside;
+  }
+
+  return inside;
+};
+
+const isPointInPolygon = (point, polygon) => {
+  if (!isPointInRing(point, polygon[0])) return false;
+
+  return !polygon.slice(1).some((hole) => isPointInRing(point, hole));
+};
+
+const getPolygonsFromGeometry = (geometry) => {
+  if (!geometry) return [];
+
+  if (geometry.type === "Polygon") return [geometry.coordinates];
+  if (geometry.type === "MultiPolygon") return geometry.coordinates;
+
+  return [];
+};
+
+const validatePolygon = (polygon) =>
+  Array.isArray(polygon) &&
+  polygon.length > 0 &&
+  polygon.every(
+    (ring) =>
+      Array.isArray(ring) &&
+      ring.length >= 4 &&
+      ring.every(
+        (coord) =>
+          Array.isArray(coord) &&
+          coord.length >= 2 &&
+          Number.isFinite(coord[0]) &&
+          Number.isFinite(coord[1]),
+      ),
+  );
+
+const loadExcludePolygons = async (targetFolder) => {
+  const excludePath = path.join(targetFolder, EXCLUDE_GEOJSON_FILE);
+
+  if (!(await exists(excludePath))) {
+    console.log(
+      `ℹ️ ${EXCLUDE_GEOJSON_FILE} is missing in ${targetFolder}; all data will be processed.`,
+    );
+    return [];
+  }
+
+  let geojson;
+
+  try {
+    geojson = JSON.parse(await readFile(excludePath, "utf-8"));
+  } catch (err) {
+    console.warn(
+      `⚠️ ${EXCLUDE_GEOJSON_FILE} could not be read as valid JSON (${err.message}); all data will be processed.`,
+    );
+    return [];
+  }
+
+  const features =
+    geojson.type === "FeatureCollection"
+      ? geojson.features
+      : geojson.type === "Feature"
+        ? [geojson]
+        : [{ geometry: geojson }];
+
+  const polygons = features.flatMap((feature) =>
+    getPolygonsFromGeometry(feature.geometry),
+  );
+  const validPolygons = polygons.filter(validatePolygon);
+
+  if (validPolygons.length === 0) {
+    console.warn(
+      `⚠️ ${EXCLUDE_GEOJSON_FILE} does not contain a valid Polygon or MultiPolygon; all data will be processed.`,
+    );
+    return [];
+  }
+
+  const { useExclude } = await prompts({
+    type: "confirm",
+    name: "useExclude",
+    message: `${EXCLUDE_GEOJSON_FILE} contains ${validPolygons.length} valid polygon(s). Use it to exclude matching 70MAI MP4 files from copy/sync?`,
+    initial: true,
+  });
+
+  if (!useExclude) {
+    console.log(
+      `ℹ️ ${EXCLUDE_GEOJSON_FILE} will not be used; all data will be processed.`,
+    );
+    return [];
+  }
+
+  console.log(`✅ Using ${EXCLUDE_GEOJSON_FILE} exclusion polygon(s).`);
+  return validPolygons;
+};
+
+const getExcluded70MaiVideoNames = async (gpsPath, polygons) => {
+  const excluded = new Set();
+
+  if (polygons.length === 0) return excluded;
+
+  if (!(await exists(gpsPath))) {
+    console.log(
+      `ℹ️ ${path.basename(gpsPath)} is missing; cannot match GPS records against ${EXCLUDE_GEOJSON_FILE}. All data will be processed.`,
+    );
+    return excluded;
+  }
+
+  const rl = readline.createInterface({
+    input: createReadStream(gpsPath),
+    crlfDelay: Infinity,
+  });
+
+  for await (const line of rl) {
+    if (!line.trim() || line.includes("$V02") || line.includes("nan")) continue;
+
+    const parts = line.trim().split(",");
+    if (parts.length <= 9) continue;
+
+    const lat = Number(parts[2]);
+    const lon = Number(parts[3]);
+    const videoName = parts[9]?.trim();
+
+    if (!videoName || !Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+
+    const point = [lon, lat];
+
+    if (polygons.some((polygon) => isPointInPolygon(point, polygon))) {
+      excluded.add(videoName.toLowerCase());
+    }
+  }
+
+  return excluded;
+};
+
+const apply70MaiExcludeFilter = async (diff, sTarget) => {
+  const polygons = await loadExcludePolygons(sTarget);
+  const gpsPath = path.join(sTarget, ...CAM_70MAI_GPS_DATA_PATH);
+  const excludedVideoNames = await getExcluded70MaiVideoNames(gpsPath, polygons);
+
+  if (excludedVideoNames.size === 0) {
+    return { diff, totalSize: calculateTotalSize(diff) };
+  }
+
+  const filteredDiff = diff.filter((file) => {
+    if (!isMp4(file.name)) return true;
+
+    const shouldExclude = excludedVideoNames.has(file.name.toLowerCase());
+
+    if (shouldExclude) {
+      console.log(
+        `🚫 Ignoring ${file.rel}: GPSData000001.txt has coordinates inside ${EXCLUDE_GEOJSON_FILE}.`,
+      );
+    }
+
+    return !shouldExclude;
+  });
+
+  const skippedCount = diff.length - filteredDiff.length;
+
+  console.log(
+    `🚫 Excluded ${skippedCount} MP4 file(s) from copy/sync using ${EXCLUDE_GEOJSON_FILE}.`,
+  );
+
+  return { diff: filteredDiff, totalSize: calculateTotalSize(filteredDiff) };
 };
 
 const buildDestPath = (relPath, srcMap, destMap, destFolderSet, sTarget) => {
@@ -778,22 +984,13 @@ export const getDeviceTypeForCard = async (selectedDrive) => {
 
   // --- 70MAI detection ---
   try {
-    const cam70maiDevices = {
-      cam_70mai_v1: ["GPSData000001.txt"],
-      cam_70mai_v2: [".GPS", "GPSData000001.txt"],
-    };
-
-    const path = Object.keys(cam70maiDevices).find((type) => {
-      const testPath = cam70maiDevices[type];
-    });
-
     const gpsPath = path.join(selectedDrive, ...CAM_70MAI_GPS_DATA_PATH);
 
     await access(gpsPath);
 
     //copy
     const sTargetDir = path.join(DEST, `70MAI`);
-    await mkdir(path.dirname(sTargetDir), { recursive: true });
+    await mkdir(sTargetDir, { recursive: true });
     await copyFile(gpsPath, path.join(sTargetDir, ...CAM_70MAI_GPS_DATA_PATH));
 
     return {
@@ -1081,7 +1278,11 @@ export const copyMissingFiles = async (sSource, sTarget, sDeviceType) => {
   const destFolderSet = buildFolderSet(destMap);
 
   console.log("🔍 Calculating diff...");
-  const { diff, totalSize } = calculateDiff(srcMap, destMap);
+  let { diff, totalSize } = calculateDiff(srcMap, destMap);
+
+  if (sDeviceType === "70mai") {
+    ({ diff, totalSize } = await apply70MaiExcludeFilter(diff, sTarget));
+  }
 
   if (diff.length === 0) {
     console.log("✅ Nothing to copy");
