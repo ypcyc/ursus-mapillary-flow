@@ -1,10 +1,10 @@
 {
-  "name": "mapillaryscript",
+  "name": "ursus_mapillary_flow",
   "version": "0.0.1",
   "description": "",
   "main": "index.js",
   "scripts": {
-    "run": "node run.js"
+    "ursus_mapillary_flow": "node ursus_mapillary_flow.js"
   },
   "keywords": [],
   "author": "",

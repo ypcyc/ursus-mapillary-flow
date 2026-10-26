@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import { readdir } from "node:fs/promises";
 
 // Константы
 const R = 6371000;
@@ -47,7 +48,7 @@ const interpolatePoints = (start, end, stepSize) => {
 };
 
 // Основная обработка
-const processAndSplitGpsData = async (inputFile, stepSize = 1.0) => {
+const processAndSplitGpsData = async (inputFile, stepSize = 1.0, aFiles) => {
   console.log(`Processing GPS data from: ${inputFile}`);
   const content = await fs.readFile(inputFile, "utf-8");
   const lines = content.split("\n");
@@ -55,15 +56,19 @@ const processAndSplitGpsData = async (inputFile, stepSize = 1.0) => {
   const videoFiles = {};
   const videoPoints = {};
 
-  let linecount = 0;
+  const missingVideos = new Set();
+
+  //let linecount = 0;
 
   for (const line of lines) {
-    console.log(`Processing line ${linecount++}: ${line}`);
+    //console.log(`Processing line ${linecount++}: ${line}`);
     if (
       !line ||
       line.includes("$V02") ||
       line.includes("nan") ||
-      line.includes("000000000000000000000000000")
+      line.includes("000000000000000000000000000") ||
+      line.includes("0,V,   000000,   000000,")
+      //NOTE: T800 sometimes has wrong timestamp -28801"
     )
       continue;
 
@@ -89,6 +94,11 @@ const processAndSplitGpsData = async (inputFile, stepSize = 1.0) => {
 
       videoName = videoName.replace("B.MP4", "");
       videoName = videoName.replace("F.MP4", "");
+      videoName = videoName.replace(".MP4", "");
+
+      if (missingVideos.has(videoName)) {
+        continue;
+      }
 
       if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
 
@@ -97,6 +107,16 @@ const processAndSplitGpsData = async (inputFile, stepSize = 1.0) => {
         const gpxTime = new Date(time.replace(" ", "T") + "Z").toISOString();
       } catch (error) {
         console.error("Error parsing time:", time);
+      }
+
+      const aFoundVideoFiles = aFiles.filter((file) =>
+        file.includes(videoName),
+      );
+
+      if (aFoundVideoFiles.length === 0) {
+        missingVideos.add(videoName);
+        console.warn(`Warning: No matching video file found for ${videoName}`);
+        continue;
       }
 
       if (!videoFiles[videoName]) {
@@ -114,7 +134,54 @@ const processAndSplitGpsData = async (inputFile, stepSize = 1.0) => {
 
       videoPoints[videoName].push([lat, lon, time]);
     } else if (parts.length > 10) {
+      //New Format
+      //1768533243,
+      // A,
+      // 56.946439,
+      // 24.002281,
+      // 19800,
+      // 83,
+      // 49,
+      // 11,
+      // -85,
+      // NO20260116-131352-000078F.MP4,
+      // 0,
+      // 0,
+      // 0
+
       videoName = parts[9];
+
+      if (videoName.substring(0, 2) !== "NO") {
+        continue;
+      }
+
+      //some bug with mp4 names?
+      videoName = videoName.replace("R.MP444", "");
+      videoName = videoName.replace("R.MP44", "");
+      videoName = videoName.replace("R.MP4", "");
+
+      videoName = videoName.replace("F.MP444", "");
+      videoName = videoName.replace("F.MP44", "");
+      videoName = videoName.replace("F.MP4", "");
+
+      videoName = videoName.replace(".MP444", "");
+      videoName = videoName.replace(".MP44", "");
+      videoName = videoName.replace(".MP4", "");
+
+      if (missingVideos.has(videoName)) {
+        continue;
+      }
+
+      const aFoundVideoFiles = aFiles.filter((file) =>
+        file.includes(videoName),
+      );
+
+      if (aFoundVideoFiles.length === 0) {
+        missingVideos.add(videoName);
+        console.warn(`Warning: No matching video file found for ${videoName}`);
+        continue;
+      }
+
       const timestampMs = Math.floor(parseFloat(parts[0]) * 1000);
 
       if (!videoFiles[videoName]) {
@@ -143,55 +210,62 @@ const processAndSplitGpsData = async (inputFile, stepSize = 1.0) => {
   for (const [videoName, points] of Object.entries(videoPoints)) {
     if (videoFiles[videoName].type === "70mai_v1") {
       points.forEach(([lat, lon, time]) => {
-        //const timestamp = new Date(time.replace(" ", "T") + "Z").getTime();
         const roundedLat = Number(lat.toFixed(6));
         const roundedLon = Number(lon.toFixed(6));
 
         allLines.push([time, roundedLat, roundedLon, videoName, "70mai_v1"]);
       });
     } else if (videoFiles[videoName].type === "70mai_v2") {
-      const { start, end } = videoFiles[videoName];
-      const timeDiff = end - start;
+      //Disable interpolation for now
+      points.forEach(([lat, lon, time]) => {
+        const roundedLat = Number(lat.toFixed(6));
+        const roundedLon = Number(lon.toFixed(6));
 
-      const numPoints = points.length;
-      const timeStep = timeDiff / (numPoints - 1);
+        allLines.push([time, roundedLat, roundedLon, videoName, "70mai_v2"]);
+      });
 
-      for (let i = 0; i < numPoints - 1; i++) {
-        const startPoint = points[i];
-        const endPoint = points[i + 1];
+      // const { start, end } = videoFiles[videoName];
+      // const timeDiff = end - start;
 
-        const interpolated = interpolatePoints(
-          startPoint.slice(0, 2),
-          endPoint.slice(0, 2),
-          stepSize,
-        );
+      // const numPoints = points.length;
+      // const timeStep = timeDiff / (numPoints - 1);
 
-        for (let j = 0; j < interpolated.length; j++) {
-          const [lat, lon] = interpolated[j];
+      // for (let i = 0; i < numPoints - 1; i++) {
+      //   const startPoint = points[i];
+      //   const endPoint = points[i + 1];
 
-          const timestamp =
-            start +
-            Math.floor(i * timeStep) +
-            Math.floor((j * timeStep) / interpolated.length);
+      //   const interpolated = interpolatePoints(
+      //     startPoint.slice(0, 2),
+      //     endPoint.slice(0, 2),
+      //     stepSize,
+      //   );
 
-          const roundedLat = Number(lat.toFixed(6));
-          const roundedLon = Number(lon.toFixed(6));
+      //   for (let j = 0; j < interpolated.length; j++) {
+      //     const [lat, lon] = interpolated[j];
 
-          if (
-            allLines.length === 0 ||
-            allLines[allLines.length - 1][1] !== roundedLat ||
-            allLines[allLines.length - 1][2] !== roundedLon
-          ) {
-            allLines.push([
-              timestamp,
-              roundedLat,
-              roundedLon,
-              videoName,
-              "70mai_v2",
-            ]);
-          }
-        }
-      }
+      //     const timestamp =
+      //       start +
+      //       Math.floor(i * timeStep) +
+      //       Math.floor((j * timeStep) / interpolated.length);
+
+      //     const roundedLat = Number(lat.toFixed(6));
+      //     const roundedLon = Number(lon.toFixed(6));
+
+      //     if (
+      //       allLines.length === 0 ||
+      //       allLines[allLines.length - 1][1] !== roundedLat ||
+      //       allLines[allLines.length - 1][2] !== roundedLon
+      //     ) {
+      //       allLines.push([
+      //         timestamp,
+      //         roundedLat,
+      //         roundedLon,
+      //         videoName,
+      //         "70mai_v2",
+      //       ]);
+      //     }
+      //   }
+      // }
     }
   }
 
@@ -213,13 +287,31 @@ const processAndSplitGpsData = async (inputFile, stepSize = 1.0) => {
   // Запись файлов (параллельно)
   await Promise.all(
     Object.entries(videoFileMap).map(async ([videoName, lines]) => {
-      const content = lines.map((l) => l.join(",")).join("\n");
+      const content = lines.map((sLine) => sLine.join(",")).join("\n");
 
-      await fs.writeFile(
-        path.join(destDir, `${videoName}.txt`),
-        content,
-        "utf-8",
+      //-28801 fix
+      const sEnding = lines[0][0] < 0 ? "_NO_TIMESTAMP" : "";
+
+      const aFoundVideoFiles = aFiles.filter((file) =>
+        file.includes(videoName),
       );
+
+      aFoundVideoFiles.forEach(async (file) => {
+        const destDir = path.dirname(file);
+        const baseName = path.basename(file);
+        const suffix = baseName.endsWith("F.MP4")
+          ? "F"
+          : baseName.endsWith("B.MP4")
+            ? "B"
+            : baseName.endsWith("R.MP4")
+              ? "R"
+              : "";
+        const prefix = baseName.startsWith("NO") ? "" : "NO";
+        const newFileName = `${prefix}${videoName}${suffix}${sEnding}.txt`;
+        const newFilePath = path.join(destDir, newFileName);
+
+        await fs.writeFile(newFilePath, content, "utf-8");
+      });
     }),
   );
 };
@@ -246,12 +338,32 @@ const convertToGpx = async (inputFile) => {
     } else if (videoType === "70mai_v2") {
       timestamp = parseInt(timestamp, 10);
 
-      const seconds = Math.floor(timestamp / 1000);
-      const millis = timestamp % 1000;
+      const oDate = new Date(timestamp);
 
-      const date = new Date(seconds * 1000);
-      const iso = date.toISOString().replace("Z", "");
-      gpxTime = `${iso}.${String(millis).padStart(3, "0")}Z`;
+      //NOTE: GPSData seconds stores date in some strange Timezone, I want to extract it from filename instead
+      const match = filename.match(
+        /^NO(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/,
+      );
+
+      if (match) {
+        const [, year, month, day, hours, minutes, seconds] = match;
+
+        oDate.setUTCFullYear(year);
+        oDate.setUTCDate(day);
+        oDate.setUTCHours(hours);
+
+        //const gpxTime = `${year}-${month}-${day}T${hours}:${minutes}:${seconds}Z`;
+
+        //console.log(gpxTime);
+      }
+
+      // const seconds = Math.floor(timestamp / 1000);
+      // const millis = timestamp % 1000;
+
+      // const date = new Date(seconds * 1000);
+      // const iso = date.toISOString().replace("Z", "");
+      // gpxTime = `${iso}.${String(millis).padStart(3, "0")}Z`;
+      gpxTime = oDate.toISOString();
     }
 
     if (!videoTracks[filename]) {
@@ -291,8 +403,8 @@ const convertToGpx = async (inputFile) => {
 
 // Обработка всех txt
 const processAllTxtFiles = async (destDir) => {
-  const files = await fs.readdir(destDir);
-  const fullPaths = files.map((file) => path.join(destDir, file));
+  const fullPaths = await getTxtFiles(destDir);
+  //const fullPaths = files.map((file) => path.join(destDir, file));
 
   const targets = fullPaths.filter(
     (f) => f.endsWith(".txt") && !f.endsWith("GPSData000001.txt"),
@@ -303,8 +415,7 @@ const processAllTxtFiles = async (destDir) => {
 
 // Удаление txt
 const deleteTxtFiles = async (destDir) => {
-  const files = await fs.readdir(destDir);
-  const fullPaths = files.map((file) => path.join(destDir, file));
+  const fullPaths = await getTxtFiles(destDir);
 
   const targets = fullPaths.filter(
     (f) => f.endsWith(".txt") && f !== "GPSData000001.txt",
@@ -314,9 +425,37 @@ const deleteTxtFiles = async (destDir) => {
 };
 
 // ✅ Главная функция (await-ready)
-export const processAndConvert = async (inputFile) => {
-  await processAndSplitGpsData(inputFile, 1.0);
+export const processAndConvert = async (inputFile, aFiles) => {
+  await processAndSplitGpsData(inputFile, 1.0, aFiles);
 
   await processAllTxtFiles(path.dirname(inputFile));
   await deleteTxtFiles(path.dirname(inputFile));
 };
+
+async function getTxtFiles(dir) {
+  const entries = await readdir(dir, { withFileTypes: true });
+
+  const files = await Promise.all(
+    entries.map(async (entry) => {
+      const fullPath = path.join(dir, entry.name);
+
+      if (entry.isDirectory()) {
+        return getTxtFiles(fullPath);
+      }
+
+      if (
+        entry.isFile() &&
+        entry.name.endsWith(".txt") &&
+        !fullPath.includes("processed")
+      ) {
+        return fullPath;
+      }
+
+      return null;
+    }),
+  );
+
+  const aFoundTxtFiles = files.flat().filter((oItem) => oItem !== null);
+
+  return aFoundTxtFiles;
+}
