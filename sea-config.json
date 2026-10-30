@@ -1,0 +1,6 @@
+{
+  "main": "dist/app.cjs",
+  "mainFormat": "commonjs",
+  "output": "dist/ursus_mapillary_flow.exe",
+  "useCodeCache": true
+}

@@ -1,1 +1,7 @@
 node_modules/
+dist/
+DASHCAM_DATA/
+
+pnpm-lock.yaml
+mapillary_tools.exe
+exclude.geojson

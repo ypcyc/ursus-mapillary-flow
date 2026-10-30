@@ -1,3 +1,8 @@
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { pipeline } from "node:stream/promises";
+
 import {
   access,
   opendir,
@@ -7,12 +12,13 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { createWriteStream, createReadStream } from "node:fs";
-import path from "node:path";
+
 import readline from "node:readline";
 import prompts from "prompts";
 import checkDiskSpace from "check-disk-space";
 import cliProgress from "cli-progress";
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
+import { exec } from "node:child_process";
 import { rename } from "node:fs/promises";
 import { readFile } from "node:fs/promises";
 import exifr from "exifr";
@@ -21,21 +27,21 @@ import { ExifDateTime } from "exiftool-vendored";
 import { processAndConvert } from "./gps-to-gpx.js";
 import { DOMParser } from "xmldom";
 import { readdir } from "node:fs/promises";
-import { pipeline } from "node:stream/promises";
+import { promisify } from "node:util";
+import stringWidth from "string-width";
+import { fileURLToPath } from "node:url";
 
 // ----- YOUR ACTIONS (plug your logic here) -----
 
 // ---------- CONFIG ----------
 
-const ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1000;
+const MAPILLARY_RELEASES_URL =
+  "https://api.github.com/repos/mapillary/mapillary_tools/releases/latest";
 
 const isJpg = (name) => /\.(jpe?g)$/i.test(name);
 
-//const SOURCE = "H:\\DCIM";
-//const DEST = path.resolve('./working_dir/DCIM');
-const DEST = "E:\\Ursus_Mapillary_Script";
-//const DEST_DRIVE = "E:"
-const LOG_FILE = "copied.log";
+let SCRIPT_DIR = "";
+let DATA_DIR = "";
 
 const GOPRO_VERSION_PATH = ["MISC", "version.txt"];
 
@@ -68,29 +74,6 @@ const copyFolder = async (src, dest) => {
       await copyFile(srcPath, destPath);
     }
   }
-};
-
-// ---------- LOAD LOG ----------
-const loadCopiedLog = async () => {
-  const map = new Map();
-
-  if (!(await exists(LOG_FILE))) {
-    return map;
-  }
-
-  const rl = readline.createInterface({
-    input: createReadStream(LOG_FILE),
-    crlfDelay: Infinity,
-  });
-
-  for await (const line of rl) {
-    if (!line.trim()) continue;
-
-    const entry = JSON.parse(line);
-    map.set(entry.path, entry.size);
-  }
-
-  return map;
 };
 
 // ---------- SCAN SOURCE ----------
@@ -526,7 +509,7 @@ const apply70MaiExcludeFilter = async (
   sTarget,
   gpsFilePath,
 ) => {
-  const polygons = await loadExcludePolygons(DEST);
+  const polygons = await loadExcludePolygons(SCRIPT_DIR);
   const gpsPath = gpsFilePath;
   const excludedVideoNames = await getExcluded70MaiVideoNames(
     gpsPath,
@@ -660,11 +643,17 @@ const getDestinationFolders = async (dirPath, options = {}) => {
   return result;
 };
 
-function runMapillaryProcess(imagePath) {
+function runMapillaryToolsProcessCommand(imagePath) {
   return new Promise((resolve, reject) => {
     const proc = spawn(
       "mapillary_tools",
-      ["process", imagePath, "--skip_process_errors", "--duplicate_distance 1"],
+      [
+        "process",
+        imagePath,
+        "--skip_process_errors",
+        "--duplicate_distance",
+        "1",
+      ],
       {
         stdio: "pipe",
         shell: true, // IMPORTANT on Windows
@@ -672,7 +661,6 @@ function runMapillaryProcess(imagePath) {
     );
 
     proc.stdout.on("data", (data) => {
-      //console.log(`[OUT] ${data.toString()}`);
       process.stdout.write(data.toString());
     });
 
@@ -708,7 +696,8 @@ async function runMapillaryProcessVideo(sGpxPath, deviceInfoJson) {
       "process",
       sMP4Path,
       "--skip_process_errors",
-      "--duplicate_distance 1",
+      "--duplicate_distance",
+      "1",
       "--geotag_source",
       `"gpx"`,
       "--geotag_source_path",
@@ -831,24 +820,32 @@ const moveToProcessed = async (filePath) => {
   console.log(`📦 moved → ${newName}`);
 };
 
-export const processFolders = async () => {
-  const folders = await getDestinationDeviceFolders(DEST);
+export const runMapillaryToolsProcessPhotoFolders = async () => {
+  const folders = await getDestinationDeviceFolders(DATA_DIR);
 
   const selectedFolder = await selectFolder(folders);
+  if (!selectedFolder) {
+    console.log("No selection made");
+    return;
+  }
 
   const subfolders = await getSubfolders(selectedFolder);
 
   for (const folder of subfolders) {
     console.log("➡️", folder);
 
-    await runMapillaryProcess(folder);
+    await runMapillaryToolsProcessCommand(folder);
   }
 };
 
 export const processVideoFolders = async () => {
-  const folders = await getDestinationDeviceFolders(DEST);
+  const folders = await getDestinationDeviceFolders(DATA_DIR);
 
   const selectedFolder = await selectFolder(folders);
+  if (!selectedFolder) {
+    console.log("No selection made");
+    return;
+  }
 
   const deviceInfoPath = path.join(selectedFolder, DEVICE_INFO_FILE);
 
@@ -1002,7 +999,7 @@ const selectDrive = async (drives) => {
   const response = await prompts({
     type: "select",
     name: "drive",
-    message: "Select SD card / drive:",
+    message: "Select SD card / drive of your camera:",
     choices: drives.map((drive) => ({
       title: drive,
       value: drive,
@@ -1051,7 +1048,7 @@ export const getDeviceTypeForCard = async (selectedDrive) => {
         name: cameraType,
         id: wifiMac,
         sourceFolder: path.join(selectedDrive, "DCIM"),
-        targetFolder: path.join(DEST, `${cameraType}_${wifiMac}`),
+        targetFolder: path.join(DATA_DIR, `${cameraType}_${wifiMac}`),
         raw: info, // optional, useful for debugging
       };
     }
@@ -1091,8 +1088,10 @@ export const getDeviceTypeForCard = async (selectedDrive) => {
 
     const devParams = await fnCheckParams();
 
-    const targetFolder = path.join(DEST, devParams.device);
+    const targetFolder = path.join(DATA_DIR, devParams.device);
     await mkdir(targetFolder, { recursive: true });
+
+    await ensureDeviceInfoJsonExist(targetFolder);
 
     const destGpsPath = path.join(targetFolder, "GPSData000001.txt");
     const output = createWriteStream(destGpsPath);
@@ -1108,7 +1107,7 @@ export const getDeviceTypeForCard = async (selectedDrive) => {
       name: devParams.device,
       id: null,
       sourceFolder: path.join(selectedDrive, "Normal"),
-      targetFolder: path.join(DEST, devParams.device),
+      targetFolder: path.join(DATA_DIR, devParams.device),
       gpsFilePath: destGpsPath,
     };
   } catch (err) {
@@ -1121,9 +1120,48 @@ export const getDeviceTypeForCard = async (selectedDrive) => {
     name: "UNKNOWN_DEVICE",
     id: null,
     sourceFolder: path.join(selectedDrive, "unknown"),
-    targetFolder: path.join(DEST, "UNKNOWN_DEVICE"),
+    targetFolder: path.join(DATA_DIR, "UNKNOWN_DEVICE"),
   };
 };
+
+async function ensureDeviceInfoJsonExist(targetFolder) {
+  const deviceInfoPath = path.join(targetFolder, "device_info.json");
+
+  if (fs.existsSync(deviceInfoPath)) {
+    return true;
+  }
+
+  console.log(`\n⚠️ device_info.json not found in:`);
+  console.log(targetFolder);
+
+  const { proceed } = await prompts({
+    type: "confirm",
+    name: "proceed",
+    message: "device_info.json not found. Create it?",
+    initial: true,
+  });
+
+  if (!proceed) {
+    console.log("❌ device_info.json is required.");
+    process.exit(1);
+  }
+
+  const { model } = await prompts({
+    type: "text",
+    name: "model",
+    message: "You have 70Mai Dashcam. What is model name?",
+    validate: (value) => (value.trim() ? true : "Model name is required"),
+  });
+
+  const deviceInfo = {
+    device_make: "70mai",
+    device_model: model.trim(),
+  };
+
+  fs.writeFileSync(deviceInfoPath, JSON.stringify(deviceInfo, null, 2), "utf8");
+
+  console.log(`✅ Created ${deviceInfoPath}`);
+}
 
 async function getFilesByExtension(dir, extension) {
   const entries = await readdir(dir, { withFileTypes: true });
@@ -1278,10 +1316,10 @@ const fixExifTakenDate = async (rootDir) => {
 };
 
 export const fixExifDateProcess = async () => {
-  const folders = await getDestinationFolders(DEST);
+  const folders = await getDestinationFolders(DATA_DIR);
 
   for (const folder of folders) {
-    const folderFullPath = path.join(DEST, folder);
+    const folderFullPath = path.join(DATA_DIR, folder);
 
     console.log("➡️ Fixing EXIF:", folderFullPath);
 
@@ -1367,7 +1405,7 @@ ${points
 };
 
 export const get70MaiGpxProcess = async () => {
-  const folders = await getDestinationDeviceFolders(DEST);
+  const folders = await getDestinationDeviceFolders(DATA_DIR);
 
   for (const folder of folders) {
     console.log("➡️ Checking GPSData000001.txt in:", folder);
@@ -1384,9 +1422,13 @@ export const get70MaiGpxProcess = async () => {
 };
 
 export const convert70MaiToGpxProcess = async () => {
-  const folders = await getDestinationDeviceFolders(DEST);
+  const folders = await getDestinationDeviceFolders(DATA_DIR);
 
   const selectedFolder = await selectFolder(folders);
+  if (!selectedFolder) {
+    console.log("No selection made");
+    return;
+  }
 
   console.log("➡️ Checking GPSData000001.txt in:", selectedFolder);
 
@@ -1448,7 +1490,7 @@ export const copyMissingFiles = async (device) => {
   console.log(`📦 Files to copy: ${aSourceDiffFiles.length}`);
   console.log(`📦 Total: ${(totalSize / 1024 ** 3).toFixed(2)} GB`);
 
-  const { free } = await checkDiskSpace(DEST);
+  const { free } = await checkDiskSpace(DATA_DIR);
 
   console.log(`💾 Free space: ${(free / 1024 ** 3).toFixed(2)} GB`);
 
@@ -1482,12 +1524,12 @@ export const copyMissingFiles = async (device) => {
 const uploadFolders = async () => {
   console.log("☁️ Uploading files...");
 
-  const folders = await getDestinationFolders(DEST, {
+  const folders = await getDestinationFolders(DATA_DIR, {
     requireFile: "mapillary_image_description.json",
   });
 
   for (const folder of folders) {
-    const folderFullPath = path.join(DEST, folder);
+    const folderFullPath = path.join(DATA_DIR, folder);
 
     console.log("➡️ Uploading:", folderFullPath);
 
@@ -1514,20 +1556,52 @@ const uploadFolders = async () => {
   }
 };
 
+async function waitForExit() {
+  await prompts({
+    type: "text",
+    name: "value",
+    message: "Press Enter to close",
+  });
+}
+
 // ----- MENU LOOP -----
 
 const mainMenu = async () => {
+  printBox(`⚠️  Privacy Notice
+
+Please contribute and help make your imagery useful for different
+projects and purposes! 📷
+
+Mapillary automatically blurs faces and license plates, but your
+imagery and GPS tracks may still reveal sensitive locations, such
+as your home, workplace, or other private places.
+
+Please review your data before sharing it. If necessary, create
+exclusion polygons to prevent private areas from being processed
+or uploaded.
+
+Your privacy is your responsibility — please contribute responsibly.
+
+* Create your filtering polygons using geojson.io: 
+ https://geojson.io/
+
+* Save the file as "exclude.geojson" and place it
+ in the root folder of this script.
+`);
+
   while (true) {
     const { action } = await prompts({
       type: "select",
       name: "action",
-      message:
-        "Choose an action. Use geojson.io to create polygons for filtering 70mai GPSData000001.txt files. save as exclude.geojson in the root folder of this script.",
+      message: "Choose an action:",
       choices: [
-        { title: "1. 🔄  Copy new files from SD card", value: "copy" },
+        {
+          title: "1. 🔄  Copy new files from SD card",
+          value: "menu_copy_files",
+        },
         {
           title: "2. ⚙️ 📸  Run 'mapillary_tools' process for Photos",
-          value: "mapillary_process",
+          value: "menu_mapillary_process_photos",
         },
         {
           title:
@@ -1560,7 +1634,7 @@ const mainMenu = async () => {
     }
 
     switch (action) {
-      case "copy":
+      case "menu_copy_files":
         await copyMainProcess();
         break;
       case "fix_exif_date":
@@ -1569,8 +1643,8 @@ const mainMenu = async () => {
       case "convert_70mai_to_gpx":
         await convert70MaiToGpxProcess();
         break;
-      case "mapillary_process":
-        await processFolders();
+      case "menu_mapillary_process_photos":
+        await runMapillaryToolsProcessPhotoFolders();
         break;
       case "mapillary_process_videos":
         await processVideoFolders();
@@ -1589,5 +1663,216 @@ const mainMenu = async () => {
   }
 };
 
+function getAppDirectory() {
+  // Running as packaged EXE
+  if (process.pkg) {
+    return path.dirname(process.execPath);
+  }
+
+  // Running as .js
+
+  //index.js location , not root return path.dirname(fileURLToPath(import.meta.url));
+  return process.cwd();
+}
+
+function findLocalMapillaryTools() {
+  const exeName = "mapillary_tools.exe";
+  //const appDirectory = getAppDirectory();
+  const exePath = path.join(SCRIPT_DIR, exeName);
+
+  return fs.existsSync(exePath) ? exePath : null;
+}
+
+const execFileAsync = promisify(execFile);
+
+async function getMapillaryToolsVersion(executablePath) {
+  try {
+    const { stdout, stderr } = await execFileAsync(executablePath, [
+      "--version",
+    ]);
+
+    return (stdout || stderr).trim();
+  } catch {
+    return null;
+  }
+}
+const findMapillaryTools = async () => {
+  // 1. Check in same folder
+  const localPath = findLocalMapillaryTools();
+
+  if (localPath) {
+    return localPath;
+  }
+
+  try {
+    const { stdout } = await execFileAsync("where.exe", ["mapillary_tools"]);
+
+    const executablePath = stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean);
+
+    return executablePath ?? null;
+  } catch {
+    return null;
+  }
+};
+
+async function downloadLatestMapillaryTools() {
+  console.log("\n🔍 Checking latest Mapillary Tools release...");
+
+  const response = await fetch(MAPILLARY_RELEASES_URL, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      "User-Agent": "YourApp",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `GitHub API request failed: ${response.status} ${response.statusText}`,
+    );
+  }
+
+  const release = await response.json();
+
+  const version = release.tag_name.replace(/^v/, "");
+
+  let assetName;
+
+  if (process.platform === "win32") {
+    if (os.arch() === "x64") {
+      assetName = `mapillary_tools-${version}-win-64bit.exe`;
+    } else if (os.arch() === "ia32") {
+      assetName = `mapillary_tools-${version}-win-32bit.exe`;
+    } else {
+      throw new Error(`Unsupported Windows architecture: ${os.arch()}`);
+    }
+  } else {
+    throw new Error(`Unsupported platform: ${process.platform}`);
+  }
+
+  const asset = release.assets.find((item) => item.name === assetName);
+
+  if (!asset) {
+    throw new Error(
+      `Could not find asset "${assetName}" in release ${release.tag_name}`,
+    );
+  }
+
+  // Folder where your wrapper EXE/script is running from
+  //const appDirectory = getAppDirectory();
+
+  const targetPath = path.join(SCRIPT_DIR, "mapillary_tools.exe");
+
+  console.log("");
+  console.log(`Mapillary Tools: ${release.tag_name}`);
+  console.log(`File: ${asset.name}`);
+  console.log(`Source: ${asset.browser_download_url}`);
+  console.log(`Destination: ${targetPath}`);
+  console.log("");
+
+  console.log("⬇️ Downloading...");
+
+  const downloadResponse = await fetch(asset.browser_download_url, {
+    headers: {
+      "User-Agent": "YourApp",
+    },
+  });
+
+  if (!downloadResponse.ok || !downloadResponse.body) {
+    throw new Error(
+      `Download failed: ${downloadResponse.status} ${downloadResponse.statusText}`,
+    );
+  }
+
+  const temporaryPath = `${targetPath}.download`;
+
+  try {
+    await pipeline(downloadResponse.body, createWriteStream(temporaryPath));
+
+    fs.renameSync(temporaryPath, targetPath);
+  } catch (error) {
+    if (fs.existsSync(temporaryPath)) {
+      fs.unlinkSync(temporaryPath);
+    }
+
+    throw error;
+  }
+
+  console.log("✅ Mapillary Tools downloaded successfully.");
+  console.log(`📁 ${targetPath}`);
+
+  return targetPath;
+}
+function displayWidth(text) {
+  // ⚠️ is rendered as 2 columns in Windows Terminal
+  return stringWidth(text.replaceAll("⚠️", "⚠ "));
+}
+
+function printBox(text) {
+  const lines = text.split("\n");
+  const width = Math.max(...lines.map(displayWidth));
+
+  console.log(`┌${"─".repeat(width + 2)}┐`);
+
+  for (const line of lines) {
+    const padding = width - displayWidth(line);
+
+    console.log(`│ ${line}${" ".repeat(padding)} │`);
+  }
+
+  console.log(`└${"─".repeat(width + 2)}┘`);
+}
 // ----- START -----
-mainMenu().catch(console.error);
+
+const startScript = async () => {
+  console.clear();
+
+  SCRIPT_DIR = getAppDirectory();
+  DATA_DIR = path.join(SCRIPT_DIR, "DASHCAM_DATA");
+  await mkdir(DATA_DIR, { recursive: true });
+
+  console.log("🔍 Checking mapillary_tools...");
+
+  const mapillaryToolsPath = await findMapillaryTools();
+
+  if (mapillaryToolsPath) {
+    const version = await getMapillaryToolsVersion(mapillaryToolsPath);
+    console.clear();
+    console.log(`✅ Mapillary Tools found: ${version}`);
+
+    await mainMenu();
+  } else {
+    console.log("❌ Mapillary Tools not found.");
+
+    const { proceed } = await prompts({
+      type: "confirm",
+      name: "proceed",
+      message: "Download the latest Mapillary Tools?",
+      initial: true,
+    });
+    if (proceed) {
+      const downloadedPath = await downloadLatestMapillaryTools();
+
+      const version = await getMapillaryToolsVersion(downloadedPath);
+
+      console.clear();
+
+      console.log(`✅ Mapillary Tools installed: ${version}`);
+
+      // Show privacy notice...
+
+      await mainMenu();
+    }
+  }
+};
+
+startScript()
+  .catch((err) => {
+    console.error("❌ Fatal error:", err);
+    process.exit(1);
+  })
+  .finally(async () => {
+    await waitForExit();
+  });
